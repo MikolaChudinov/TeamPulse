@@ -1,0 +1,126 @@
+// src/main.ts (NestJS backend setup)
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { ValidationPipe } from '@nestjs/common';
+import * as morgan from 'morgan';
+import * as helmet from 'helmet';
+import { MetricsMiddleware } from './metrics/metrics.middleware';
+import { MetricsService } from './metrics/metrics.service';
+import * as promClient from 'prom-client';
+import { Request, Response } from 'express';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.useGlobalPipes(new ValidationPipe());
+  app.enableCors();
+  app.use(morgan('combined'));
+  app.use(helmet());
+  app.use(MetricsMiddleware);
+
+  const metricsService = app.get(MetricsService);
+  app.getHttpAdapter().getInstance().get('/metrics', async (req: Request, res: Response) => {
+    res.set('Content-Type', promClient.register.contentType);
+    res.end(await promClient.register.metrics());
+  });
+
+  await app.listen(3000);
+  console.log('🚀 Server running on http://localhost:3000');
+}
+bootstrap();
+
+// Grafana Dashboard Configuration
+// Use the following PromQL queries to monitor your API:
+// - Total Requests: rate(http_requests_total[5m])
+// - Request Duration: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+// - Error Rate: rate(http_requests_total{status=~"5.."}[5m])
+
+// Alertmanager Configuration for Prometheus
+// Add the following to your prometheus.yml to enable alerts:
+//
+// alerting:
+//   alertmanagers:
+//     - static_configs:
+//         - targets:
+//           - 'localhost:9093'
+//
+// rule_files:
+//   - "alert.rules.yml"
+//
+// Create alert.rules.yml file with the following:
+//
+// groups:
+//   - name: API Alerts
+//     rules:
+//       - alert: HighErrorRate
+//         expr: rate(http_requests_total{status_code=~"5.."}[5m]) > 0.05
+//         for: 1m
+//         labels:
+//           severity: critical
+//         annotations:
+//           summary: "High error rate detected"
+//           description: "More than 5% of requests are failing."
+
+// Alertmanager configuration file (alertmanager.yml)
+// route:
+//   receiver: 'slack_notifications'
+// receivers:
+//   - name: 'slack_notifications'
+//     slack_configs:
+//       - send_resolved: true
+//         channel: '#alerts'
+//         api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+// src/metrics/metrics.service.ts
+import { Injectable } from '@nestjs/common';
+import * as client from 'prom-client';
+
+@Injectable()
+export class MetricsService {
+  private readonly httpRequestsTotal: client.Counter;
+  private readonly httpRequestDuration: client.Histogram;
+
+  constructor() {
+    this.httpRequestsTotal = new client.Counter({
+      name: 'http_requests_total',
+      help: 'Total number of HTTP requests',
+      labelNames: ['method', 'status_code'],
+    });
+
+    this.httpRequestDuration = new client.Histogram({
+      name: 'http_request_duration_seconds',
+      help: 'Histogram of request durations',
+      labelNames: ['method', 'status_code'],
+      buckets: [0.1, 0.5, 1, 2, 5, 10],
+    });
+  }
+
+  incrementRequestCount(method: string, statusCode: number) {
+    this.httpRequestsTotal.inc({ method, status_code: statusCode });
+  }
+
+  observeRequestDuration(method: string, statusCode: number, duration: number) {
+    this.httpRequestDuration.observe({ method, status_code: statusCode }, duration);
+  }
+}
+
+// src/metrics/metrics.middleware.ts
+import { Injectable, NestMiddleware } from '@nestjs/common';
+import { Request, Response, NextFunction } from 'express';
+import { MetricsService } from './metrics.service';
+
+@Injectable()
+export class MetricsMiddleware implements NestMiddleware {
+  constructor(private readonly metricsService: MetricsService) {}
+
+  use(req: Request, res: Response, next: NextFunction) {
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = (Date.now() - start) / 1000;
+      this.metricsService.observeRequestDuration(req.method, res.statusCode, duration);
+      this.metricsService.incrementRequestCount(req.method, res.statusCode);
+    });
+    next();
+  }
+}
+
+// Теперь API экспортирует метрики Prometheus по маршруту /metrics, поддерживает Grafana и отправляет алерты в Slack через Alertmanager
