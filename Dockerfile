@@ -20,5 +20,5 @@ RUN npm run build
 EXPOSE 3000
 
 # Команда запуска сервера
-CMD ["npm", "run", "start"]
+CMD ["node", "dist/main.js"]
 
